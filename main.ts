@@ -1,101 +1,102 @@
-// make.fun competition "btc-cent-forecast-01" point forecaster.
-// Under mean-absolute-error scoring the best point forecast is the conditional median of the price
-// four hours ahead; the house baseline is persistence (the checkpoint's last close unchanged), and the
-// recorded pool price drifts slightly back toward its recent mean, so pulling the last price a small
-// fraction (0.065) of the gap to its 24-hour mean adds a tiny expected improvement. Keeping that
-// fraction small limits the damage when the market trends instead of reverting. If a case file cannot
-// be read as expected (bad JSON, a missing or empty markets array, an empty prices array, or a last
-// price that is not a finite number), the program still writes a well-formed row with price 1.0 so an
-// entry with any invalid case is not disqualified.
+// btc-cent-forecast-01 — make.fun BTC cent forecast competition.
+//
+// The house baseline guesses persistence: the checkpoint's last close, unchanged. The target is
+// scored by mean absolute error, so the best single number is an estimate of the conditional median
+// of the price 240 minutes ahead, and persistence is the starting point for it. The recorded pool
+// price drifts slightly back toward its recent mean, so the forecast adds a small 6.5% share of the
+// gap between the last close and the mean of the last 1440 closes (24 hours), which nudges the guess
+// toward the centre of the local distribution; the share is kept small so a trending market, where
+// reversion fails, costs little.
+//
+// Any case that cannot be read as expected is forecast at 1.0 rather than skipped or malformed,
+// because a single invalid entry forfeits the whole prize.
 
-import { readdirSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+'use strict';
 
-const inputDir = process.env.MAKEFUN_INPUT_DIR ?? "/input";
-const outputDir = process.env.MAKEFUN_OUTPUT_DIR ?? "/output";
+const fs = require('node:fs');
+const path = require('node:path');
 
-const PRICE_MIN = 0.00001;
-const PRICE_MAX = 9999999.99999;
-const GRID = 1e5;
-const MEAN_WINDOW = 1440;
-const MEAN_WEIGHT = 0.065;
-const FALLBACK_PRICE = 1.0;
+const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR || '/input';
+const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR || '/output';
 
-interface CaseMarket {
-  prices?: unknown;
+const LOOKBACK_MINUTES = 1440;   // 24 hours of one-minute closes
+const REVERSION_WEIGHT = 0.065;  // share of the 24-hour gap added to the last close
+const MIN_PRICE = 0.00001;       // the price grid the answer lives on
+const MAX_PRICE = 9999999.99999;
+const FALLBACK_PRICE = 1.0;      // written for any case that cannot be read
+
+// Put a number on the price grid: clamp to the allowed range, then round to five decimals.
+function toPrice(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return FALLBACK_PRICE;
+  const clamped = Math.min(MAX_PRICE, Math.max(MIN_PRICE, value));
+  const rounded = Number(clamped.toFixed(5));
+  return Number.isFinite(rounded) ? rounded : FALLBACK_PRICE;
 }
 
-interface CaseFile {
-  markets?: CaseMarket[];
-}
-
-function roundToGrid(value: number): number {
-  const clamped = Math.min(PRICE_MAX, Math.max(PRICE_MIN, value));
-  return Math.round(clamped * GRID) / GRID;
-}
-
-function forecastForCase(raw: string): number {
-  let parsed: CaseFile;
+// One forecast for one case, from the case's canonical JSON text.
+function forecast(caseId, text) {
+  let doc;
   try {
-    parsed = JSON.parse(raw) as CaseFile;
+    doc = JSON.parse(text);
   } catch {
-    return FALLBACK_PRICE;
+    return { case: caseId, price: FALLBACK_PRICE };
   }
 
-  const markets = parsed?.markets;
-  if (!Array.isArray(markets) || markets.length === 0) {
-    return FALLBACK_PRICE;
-  }
+  const markets = doc && Array.isArray(doc.markets) ? doc.markets : null;
+  if (!markets || markets.length === 0) return { case: caseId, price: FALLBACK_PRICE };
 
-  const prices = markets[0]?.prices;
-  if (!Array.isArray(prices) || prices.length === 0) {
-    return FALLBACK_PRICE;
-  }
+  const market = markets[0];
+  const prices = market && Array.isArray(market.prices) ? market.prices : null;
+  if (!prices || prices.length === 0) return { case: caseId, price: FALLBACK_PRICE };
 
   const last = prices[prices.length - 1];
-  if (typeof last !== "number" || !Number.isFinite(last)) {
-    return FALLBACK_PRICE;
+  if (typeof last !== 'number' || !Number.isFinite(last)) {
+    return { case: caseId, price: FALLBACK_PRICE };
   }
 
   let guess = last;
-  if (prices.length >= MEAN_WINDOW) {
+  if (prices.length >= LOOKBACK_MINUTES) {
     let sum = 0;
-    let count = 0;
-    for (let i = prices.length - MEAN_WINDOW; i < prices.length; i++) {
-      const value = prices[i];
-      if (typeof value === "number" && Number.isFinite(value)) {
-        sum += value;
-        count++;
+    let complete = true;
+    for (let i = prices.length - LOOKBACK_MINUTES; i < prices.length; i += 1) {
+      const price = prices[i];
+      if (typeof price !== 'number' || !Number.isFinite(price)) {
+        complete = false;
+        break;
       }
+      sum += price;
     }
-    if (count > 0) {
-      const mean = sum / count;
-      guess = last + MEAN_WEIGHT * (mean - last);
+    if (complete) {
+      const mean = sum / LOOKBACK_MINUTES;
+      guess = last + REVERSION_WEIGHT * (mean - last);
     }
   }
 
-  return roundToGrid(guess);
+  return { case: caseId, price: toPrice(guess) };
 }
 
-function main(): void {
-  const names = readdirSync(inputDir)
-    .filter((name) => name.endsWith(".in"))
+function main() {
+  const files = fs
+    .readdirSync(INPUT_DIR)
+    .filter((name) => name.endsWith('.in'))
     .sort();
 
-  mkdirSync(outputDir, { recursive: true });
+  fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 
-  for (const name of names) {
-    let price = FALLBACK_PRICE;
+  for (const file of files) {
+    const caseId = file.slice(0, -'.in'.length);
+    const source = path.join(INPUT_DIR, file);
+
+    let text = null;
     try {
-      price = forecastForCase(readFileSync(join(inputDir, name), "utf8"));
+      text = fs.readFileSync(source, 'utf8');
     } catch {
-      price = FALLBACK_PRICE;
+      text = null;
     }
 
-    const caseId = name.slice(0, -".in".length);
-    const output = { forecasts: [{ case: caseId, price }] };
-    const outName = caseId + ".out";
-    writeFileSync(join(outputDir, outName), JSON.stringify(output) + "\n", "utf8");
+    const row = text === null ? { case: caseId, price: FALLBACK_PRICE } : forecast(caseId, text);
+    const target = path.join(OUTPUT_DIR, caseId + '.out');
+    fs.writeFileSync(target, JSON.stringify({ forecasts: [row] }) + '\n', 'utf8');
   }
 }
 
