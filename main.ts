@@ -33,26 +33,34 @@ function toPrice(value) {
   return Number.isFinite(rounded) ? rounded : FALLBACK_PRICE;
 }
 
-// One forecast for one case, from the case's canonical JSON text.
-function forecast(caseId, text) {
+// One finished forecast row for one case: read <caseId>.in, parse it, apply every guard, and fall
+// back to the price 1.0 whenever the case cannot be read as expected.
+function buildRow(caseId) {
+  const fallback = { case: caseId, price: FALLBACK_PRICE };
+
+  let text;
+  try {
+    text = fs.readFileSync(path.join(INPUT_DIR, caseId + '.in'), 'utf8');
+  } catch {
+    return fallback;
+  }
+
   let doc;
   try {
     doc = JSON.parse(text);
   } catch {
-    return { case: caseId, price: FALLBACK_PRICE };
+    return fallback;
   }
 
   const markets = doc && Array.isArray(doc.markets) ? doc.markets : null;
-  if (!markets || markets.length === 0) return { case: caseId, price: FALLBACK_PRICE };
+  if (!markets || markets.length === 0) return fallback;
 
   const market = markets[0];
   const prices = market && Array.isArray(market.prices) ? market.prices : null;
-  if (!prices || prices.length === 0) return { case: caseId, price: FALLBACK_PRICE };
+  if (!prices || prices.length === 0) return fallback;
 
   const last = prices[prices.length - 1];
-  if (typeof last !== 'number' || !Number.isFinite(last)) {
-    return { case: caseId, price: FALLBACK_PRICE };
-  }
+  if (typeof last !== 'number' || !Number.isFinite(last)) return fallback;
 
   let guess = last;
   if (prices.length >= LOOKBACK_MINUTES) {
@@ -85,16 +93,7 @@ function main() {
 
   for (const file of files) {
     const caseId = file.slice(0, -'.in'.length);
-    const source = path.join(INPUT_DIR, file);
-
-    let text = null;
-    try {
-      text = fs.readFileSync(source, 'utf8');
-    } catch {
-      text = null;
-    }
-
-    const row = text === null ? { case: caseId, price: FALLBACK_PRICE } : forecast(caseId, text);
+    const row = buildRow(caseId);
     const target = path.join(OUTPUT_DIR, caseId + '.out');
     fs.writeFileSync(target, JSON.stringify({ forecasts: [row] }) + '\n', 'utf8');
   }
